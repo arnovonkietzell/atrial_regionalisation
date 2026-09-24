@@ -1,0 +1,6 @@
+vtk
+pyvista
+pyvistaqt
+PyQt5
+numpy
+scipy

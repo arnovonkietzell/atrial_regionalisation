@@ -1,0 +1,14 @@
+{
+    "num_of_systems": 1,
+    "num_of_simulations": 1,
+    "static_widgets": [
+        {
+            "name": "chamber",
+            "widget_type": "QComboBox",
+            "properties": {
+                "items": ["LA", "RA"],
+                "currentText": "LA"
+            }
+        }
+    ]
+}
