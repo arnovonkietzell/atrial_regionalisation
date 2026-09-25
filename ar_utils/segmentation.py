@@ -172,11 +172,29 @@ def label_regions(app) -> tuple[np.ndarray, list[ComponentMatch], dict]:
     # a junction vertex are excluded from the adjacency graph entirely
     # (never bridge two components), leaving a thin unlabeled halo there
     # instead of a false merge.
+    #
+    # A single curve can also revisit the same vertex twice without a
+    # second curve ever being involved: a loop or multi-waypoint path is
+    # built by chaining Dijkstra geodesics between consecutive waypoints
+    # (see geometry.dense_chain), and if two non-adjacent segments of that
+    # chain happen to cross - more likely the sparser the waypoints, since
+    # each geodesic then has more freedom to bow away from the intended
+    # route - only the mesh edges belonging to *those two segments* get cut
+    # at the crossing vertex, not necessarily its whole edge ring. Counting
+    # *distinct curve names* per vertex misses this entirely, since it's
+    # still only one name; what actually matters is how many times the
+    # vertex was visited in total, by any curve.
     vertex_curve_count: dict[int, set[str]] = {}
+    self_crossing_vertices: set[int] = set()
     for name, ids in curves.items():
+        seen_in_this_curve: set[int] = set()
         for v in ids:
             vertex_curve_count.setdefault(v, set()).add(name)
+            if v in seen_in_this_curve:
+                self_crossing_vertices.add(v)
+            seen_in_this_curve.add(v)
     junction_vertices = {v for v, names in vertex_curve_count.items() if len(names) >= 2}
+    junction_vertices |= self_crossing_vertices
     excluded_cells = {
         cell_id for cell_id, verts in enumerate(cells)
         if any(v in junction_vertices for v in verts)
