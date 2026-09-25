@@ -156,12 +156,16 @@ def loop_path_name(a: str, loop_name: str, b: str) -> str:
 # The LAA_neck loop has two arcs relative to its composite path's two
 # loop-attachment points (nearest-to-A and nearest-to-F): the short arc
 # between them (already folded into the composite's own tag) and the long
-# arc (the rest of the loop's circumference). The long arc genuinely
-# borders whichever of segment 4 / segment 6 the composite doesn't - in
-# practice this is consistently segment 6 (A's attachment point sits close
-# to where segment 4 and 6 already meet, leaving segment 6 to wrap around
-# most of the appendage base), so segment 6 alone also expects "LAA_neck"
-# as well as the composite path.
+# arc (the rest of the loop's circumference, closed back to wherever the
+# operator's first LAA_neck waypoint happens to sit - see
+# segmentation.collect_curves). The long arc genuinely borders whichever of
+# segment 4 / segment 6 that first waypoint's side of the loop actually
+# sits nearest to - this is NOT reliably "always segment 6": which of the
+# two it is flips between sessions depending on exactly where that first
+# click lands relative to the loop's two attachment points, confirmed by
+# real placements where it was segment 4 throughout. Both therefore accept
+# "LAA_neck" as an optional extra tag (LA_OPTIONAL_BORDERS below) rather
+# than either requiring or forbidding it.
 #
 # Segment 16 only comes into existence if the E-F-H-I-E loop isn't (fully)
 # on the mesh's own mitral-annulus boundary: when every one of its edges is
@@ -178,7 +182,7 @@ LA_SEGMENT_BORDERS: dict[int, frozenset[str]] = {
     4: frozenset({edge_name("A", "C"), edge_name("E", "C"), edge_name("E", "F"), loop_path_name("A", "LAA_neck", "F")}),
     5: frozenset({"LAA_neck"}),
     6: frozenset({edge_name("F", "H"), edge_name("H", "B"), "LPV_antrum_outer",
-                  loop_path_name("A", "LAA_neck", "F"), "LAA_neck"}),
+                  loop_path_name("A", "LAA_neck", "F")}),
     7: frozenset({edge_name("B", "D"), edge_name("H", "I"), edge_name("H", "B"), edge_name("D", "I")}),
     8: frozenset({edge_name("I", "E"), edge_name("E", "C"), edge_name("D", "I"), "RPV_antrum_outer"}),
     16: frozenset({edge_name("E", "F"), edge_name("F", "H"), edge_name("H", "I"), edge_name("I", "E")}),
@@ -235,6 +239,19 @@ LA_SUBSET_MATCH_SEGMENTS: frozenset[int] = frozenset({5, 16})
 RA_SUBSET_MATCH_SEGMENTS: frozenset[int] = frozenset({17, 18, 19})
 _SUBSET_MATCH_SEGMENTS = {"LA": LA_SUBSET_MATCH_SEGMENTS, "RA": RA_SUBSET_MATCH_SEGMENTS}
 
+# Segments that may - or may not - additionally touch these tags on top of
+# their own required LA_SEGMENT_BORDERS/RA_SEGMENT_BORDERS set, without that
+# extra tag counting as a mismatch either way (unlike the strict subset-match
+# segments above, these still require every one of their own regular tags to
+# be present too - only the tags listed here are optional). See the
+# LA_SEGMENT_BORDERS comment on segments 4/6 for why "LAA_neck" needs this.
+LA_OPTIONAL_BORDERS: dict[int, frozenset[str]] = {
+    4: frozenset({"LAA_neck"}),
+    6: frozenset({"LAA_neck"}),
+}
+RA_OPTIONAL_BORDERS: dict[int, frozenset[str]] = {}
+_OPTIONAL_BORDERS = {"LA": LA_OPTIONAL_BORDERS, "RA": RA_OPTIONAL_BORDERS}
+
 
 def get_segment_borders(chamber: str) -> dict[int, frozenset[str]]:
     chamber = chamber.upper()
@@ -248,6 +265,13 @@ def get_subset_match_segments(chamber: str) -> frozenset[int]:
     if chamber == "BOTH":
         return LA_SUBSET_MATCH_SEGMENTS | RA_SUBSET_MATCH_SEGMENTS
     return _SUBSET_MATCH_SEGMENTS.get(chamber, frozenset())
+
+
+def get_optional_borders(chamber: str) -> dict[int, frozenset[str]]:
+    chamber = chamber.upper()
+    if chamber == "BOTH":
+        return {**LA_OPTIONAL_BORDERS, **RA_OPTIONAL_BORDERS}
+    return dict(_OPTIONAL_BORDERS.get(chamber, {}))
 
 
 def get_edges(chamber: str) -> list[tuple[str, str]]:

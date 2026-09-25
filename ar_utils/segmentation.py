@@ -33,7 +33,7 @@ import numpy as np
 from scipy.sparse import coo_matrix
 from scipy.sparse.csgraph import connected_components
 
-from .geodesics import edge_name, get_segment_borders, get_subset_match_segments, loop_path_name
+from .geodesics import edge_name, get_optional_borders, get_segment_borders, get_subset_match_segments, loop_path_name
 from .geometry import arc_between, nearest_on_point_list, smart_chain
 
 
@@ -59,18 +59,30 @@ def _mesh_edge_to_cells(cells: list[list[int]]) -> dict[frozenset, list[int]]:
     return edge_cells
 
 
-def collect_curves(app) -> dict[str, list[int]]:
+def collect_curves(app) -> tuple[dict[str, list[int]], set[str]]:
     """Collect every drawn boundary curve as {name: dense ordered vertex
-    ids}. Each segment of every multi-point curve (boundary_arc_edges,
-    loops, paths) independently resolves to a rim arc if its two endpoints
-    are on the same detected mesh boundary loop, or a plain geodesic
-    otherwise (see geometry.smart_chain) - `label_regions` decides, per
-    resulting edge (not per curve), whether that means a real graph cut or
-    a rim-touch tag, since an open boundary edge only ever touches one
-    cell and so can't be "cut" in the usual two-sided sense."""
+    ids}, plus the subset of those names that are *closed* loops (rather
+    than open point-to-point curves). Each segment of every multi-point
+    curve (boundary_arc_edges, loops, paths) independently resolves to a
+    rim arc if its two endpoints are on the same detected mesh boundary
+    loop, or a plain geodesic otherwise (see geometry.smart_chain) -
+    `label_regions` decides, per resulting edge (not per curve), whether
+    that means a real graph cut or a rim-touch tag, since an open boundary
+    edge only ever touches one cell and so can't be "cut" in the usual
+    two-sided sense.
+
+    A closed curve's dense id list does *not* repeat its first point at
+    the end (matching geometry.smart_chain/pv.lines_from_points(close=True),
+    which both leave closing a loop to the caller/renderer) - so the caller
+    must explicitly add the (ids[-1], ids[0]) pair when walking a closed
+    curve's edges, or the one mesh edge that closes the loop is silently
+    never classified as a cut, leaking the two regions it separates into
+    each other. `closed_curve_names` is exactly the set label_regions needs
+    for that."""
     mesh = app.mesh
     boundary = app.boundary
     curves: dict[str, list[int]] = {}
+    closed_curve_names: set[str] = set()
 
     for a, b in app.edges:
         pa, pb = app.session.points[a], app.session.points[b]
@@ -122,6 +134,7 @@ def collect_curves(app) -> dict[str, list[int]]:
             seed_vertex_ids = [app.session.points[n]["vertex_id"] for n in spec.seed_points]
             vertex_ids = [*seed_vertex_ids, *vertex_ids]
         curves[name] = smart_chain(mesh, boundary, vertex_ids, close=True)
+        closed_curve_names.add(name)
 
     for name in app.session.paths:
         spec = app.plan_by_name.get(name)
@@ -133,7 +146,7 @@ def collect_curves(app) -> dict[str, list[int]]:
         # start/end landmark is always reflected here.
         curves[name] = smart_chain(mesh, boundary, app._path_vertex_ids(name), close=False)
 
-    return curves
+    return curves, closed_curve_names
 
 
 @dataclass
@@ -158,9 +171,10 @@ def label_regions(app) -> tuple[np.ndarray, list[ComponentMatch], dict]:
     n_cells = len(cells)
     edge_cells = _mesh_edge_to_cells(cells)
 
-    curves = collect_curves(app)
+    curves, closed_curve_names = collect_curves(app)
     segment_borders = get_segment_borders(app.chamber)
     subset_match_segments = get_subset_match_segments(app.chamber)
+    optional_borders = get_optional_borders(app.chamber)
 
     # A loop-composite path (e.g. A_LAA_neck_F) physically reuses some of the
     # same mesh edges as the loop it routes through (e.g. LAA_neck), since
@@ -196,7 +210,14 @@ def label_regions(app) -> tuple[np.ndarray, list[ComponentMatch], dict]:
     for name, ids in curves.items():
         if name in composite_names:
             continue
-        for u, v in zip(ids, ids[1:]):
+        pairs = list(zip(ids, ids[1:]))
+        if name in closed_curve_names and len(ids) >= 2:
+            # ids does not repeat its first point at the end (see
+            # collect_curves) - without this, the one edge that actually
+            # closes the loop is never walked, silently leaking the two
+            # regions it's supposed to separate into each other.
+            pairs.append((ids[-1], ids[0]))
+        for u, v in pairs:
             edge = frozenset((u, v))
             if edge in claimed_edges:
                 continue
@@ -318,7 +339,14 @@ def label_regions(app) -> tuple[np.ndarray, list[ComponentMatch], dict]:
             # easily mean a genuinely broken/incomplete cut.
             exact = len(borders) > 0 and borders <= expected
         else:
-            exact = best_score == len(expected) and borders == expected
+            # See geodesics.get_optional_borders: a handful of segments may
+            # or may not additionally touch a specific tag (e.g. segment
+            # 4/6 and "LAA_neck") without that meaning anything is actually
+            # wrong - every one of the segment's own regular tags must
+            # still be present (expected <= borders), and nothing outside
+            # expected+optional is allowed (borders <= expected|optional).
+            optional = optional_borders.get(best_seg, frozenset())
+            exact = expected <= borders <= (expected | optional)
         if exact:
             cell_labels[comp_labels == comp_id] = best_seg
         report.append(ComponentMatch(
