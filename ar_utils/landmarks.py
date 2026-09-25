@@ -16,7 +16,7 @@ so the camera can stay put for a whole group instead of being rotated
 between every click:
   LA: A,B,C,D (postero-anterior) -> antrum-outer paths -> E,F,H,I
       (apico-basal / left anterior oblique) -> LAA_neck.
-  RA: U,M,T,V (apico-basal / left anterior oblique, tricuspid annulus) ->
+  RA: U,M,V,T (apico-basal / left anterior oblique, tricuspid annulus) ->
       J,K,N,L,O (apico-basal / basal-to-apical, venous orifices) ->
       P,Q,S (right lateral, RAA silhouette).
 
@@ -68,9 +68,9 @@ LA_POINTS: list[LandmarkSpec] = [
     ),
     LandmarkSpec(
         "LPV_antrum_outer", "path",
-        "Outer (vein-facing) border of the left antrum neck, tracing from A "
-        "to B on the side away from the dome.",
-        path_start="A", path_end="B", view="Postero-anterior",
+        "Outer (vein-facing) border of the left antrum neck, tracing from B "
+        "to A on the side away from the dome.",
+        path_start="B", path_end="A", view="Postero-anterior",
     ),
     LandmarkSpec(
         "C", "point",
@@ -86,9 +86,9 @@ LA_POINTS: list[LandmarkSpec] = [
     ),
     LandmarkSpec(
         "RPV_antrum_outer", "path",
-        "Outer (vein-facing) border of the right antrum neck, tracing from C "
-        "to D on the side away from the dome.",
-        path_start="C", path_end="D", view="Postero-anterior",
+        "Outer (vein-facing) border of the right antrum neck, tracing from D "
+        "to C on the side away from the dome.",
+        path_start="D", path_end="C", view="Postero-anterior",
     ),
     LandmarkSpec("E", "boundary", "Mitral annulus at 9 o'clock (septal) on the clock model.",
                  view="Apico-basal (~left anterior oblique)"),
@@ -111,9 +111,9 @@ RA_POINTS: list[LandmarkSpec] = [
                  view="Apico-basal (~left anterior oblique)"),
     LandmarkSpec("M", "boundary", "Tricuspid annulus at 1 o'clock (septal-superior) on the clock model.",
                  view="Apico-basal (~left anterior oblique)"),
-    LandmarkSpec("T", "boundary", "Tricuspid annulus at 8 o'clock (infero-lateral) on the clock model.",
-                 view="Apico-basal (~left anterior oblique)"),
     LandmarkSpec("V", "boundary", "Tricuspid annulus at 5 o'clock (infero-septal) on the clock model.",
+                 view="Apico-basal (~left anterior oblique)"),
+    LandmarkSpec("T", "boundary", "Tricuspid annulus at 8 o'clock (infero-lateral) on the clock model.",
                  view="Apico-basal (~left anterior oblique)"),
     LandmarkSpec("J", "boundary", "Most inferior point of the coronary sinus orifice."),
     LandmarkSpec("K", "boundary", "Most septal point of the inferior caval vein (IVC) orifice.",
