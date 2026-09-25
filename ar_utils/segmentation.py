@@ -123,10 +123,15 @@ def collect_curves(app) -> dict[str, list[int]]:
             vertex_ids = [*seed_vertex_ids, *vertex_ids]
         curves[name] = smart_chain(mesh, boundary, vertex_ids, close=True)
 
-    for name, data in app.session.paths.items():
-        if app.plan_by_name.get(name, None) is None or app.plan_by_name[name].kind != "path":
+    for name in app.session.paths:
+        spec = app.plan_by_name.get(name)
+        if spec is None or spec.kind != "path":
             continue
-        curves[name] = smart_chain(mesh, boundary, data["vertex_ids"], close=False)
+        # data["vertex_ids"] holds only the operator's own waypoints -
+        # path_start/path_end are resolved fresh from session.points, same
+        # as a loop's seed_points (see landmarks.py), so an edited
+        # start/end landmark is always reflected here.
+        curves[name] = smart_chain(mesh, boundary, app._path_vertex_ids(name), close=False)
 
     return curves
 

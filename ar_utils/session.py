@@ -18,7 +18,10 @@ class LandmarkState:
     chamber: str
     points: dict[str, dict] = field(default_factory=dict)  # name -> {vertex_id, xyz}
     loops: dict[str, dict] = field(default_factory=dict)  # name -> {vertex_ids, xyz} (closed)
-    paths: dict[str, dict] = field(default_factory=dict)  # name -> {vertex_ids, xyz} (open, incl. endpoints)
+    paths: dict[str, dict] = field(default_factory=dict)  # name -> {vertex_ids, xyz} (open, operator's own
+    # waypoints only - path_start/path_end are resolved fresh from `points`
+    # wherever the full path is needed, same as a loop's seed_points, so
+    # editing the start/end landmark afterwards keeps the path in sync)
 
     def set_point(self, name: str, vertex_id: int, xyz) -> None:
         self.points[name] = {"vertex_id": int(vertex_id), "xyz": [float(v) for v in xyz]}

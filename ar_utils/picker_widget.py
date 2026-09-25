@@ -20,11 +20,20 @@ Shift+right click  Same, but snap to the nearest point on an open mesh
                     landmark, since that depends on how the mesh was
                     clipped (see segmentation.py).
 Finish loop/path    Finish the current loop / path landmark. [N]
-Undo                Undo the last action - a placed point or a finished
-                    loop/path, whichever happened most recently. To move
-                    an already-placed landmark, undo it and place it again
-                    - there is no separate "select and move" step. [U]
+Undo                Undo the last action - a placed point, a finished
+                    loop/path, or an edit-mode move, whichever happened
+                    most recently. [U]
 Reset all           Clear every placed landmark and start over. [X]
+Edit mode           Once every landmark is placed, right click switches to
+                    editing: right click a landmark point or a loop/path
+                    waypoint to select it (it turns gold), then right
+                    click a new location on the mesh to move it there
+                    (shift+right click to snap, same as normal placement).
+                    Right-clicking a different point instead of a
+                    destination changes the selection; clicking the same
+                    one again deselects it. Works both before and after
+                    "Compute regions" - editing after a computed result
+                    discards it, same as Undo, and it must be recomputed.
 Compute regions     Once all landmarks are placed: compute the segment
                     regions (cell-based), colour the mesh by region, and
                     label each region with its number for a quick visual
@@ -73,6 +82,7 @@ POINT_COLOR = "red"
 LOOP_COLOR = "orange"
 DONE_COLOR = "seagreen"
 GEODESIC_COLOR = "dodgerblue"
+EDIT_SELECT_COLOR = "gold"
 
 # One fixed colour per label, index = label value, covering the full 1-19
 # range so LA (1-8, plus 16 - see below), RA (9-15, plus 17-19), and a
@@ -142,6 +152,16 @@ class LandmarkPickerWidget(QMainWindow):
 
         self._loop_buffer: list[tuple[int, list[float]]] = []
         self._full_loop_cache: dict[str, tuple[tuple[int, ...], list[int]]] = {}
+        # Edit mode (active once every landmark is placed - see
+        # _edit_mode_active): _edit_selected holds the ref of the landmark
+        # point or loop/path waypoint currently picked for moving, if any -
+        # ("point", name) | ("loop", name, idx) | ("path", name, idx).
+        # _marker_refs maps every such actor's pyvista name back to its ref,
+        # both to resolve a pick (via _ref_for_actor) and to know which
+        # actors to toggle pickable on/off as edit mode is entered/left
+        # (_sync_marker_pickability).
+        self._edit_selected: tuple | None = None
+        self._marker_refs: dict[str, tuple] = {}
         self.last_region_labels: np.ndarray | None = None
         self.cell_labels: np.ndarray | None = None  # set only by _confirm_and_close
         self.index = 0
@@ -289,6 +309,8 @@ class LandmarkPickerWidget(QMainWindow):
         as JSON on a previous run, purely as a debugging convenience."""
         self.session = session
         self.index = 0
+        self._edit_selected = None
+        self._marker_refs.clear()
         self._advance_to_next_pending()
         self._redraw_existing_landmarks()
         self._refresh_status()
@@ -299,6 +321,7 @@ class LandmarkPickerWidget(QMainWindow):
     def _on_pick(self, point, picker) -> None:
         current = self.current
         if current is None:
+            self._on_pick_edit(point, picker)
             return
 
         if self._shift_held():
@@ -328,6 +351,123 @@ class LandmarkPickerWidget(QMainWindow):
 
     def _shift_held(self) -> bool:
         return bool(self.plotter.iren.interactor.GetShiftKey())
+
+    # -- edit mode: moving an already-placed point --------------------------
+
+    def _edit_mode_active(self) -> bool:
+        return self.current is None
+
+    def _ref_for_actor(self, actor) -> tuple | None:
+        """Resolve a vtk actor (as returned by a picker) back to the
+        (kind, name[, idx]) ref of the movable point it represents, or None
+        if it isn't one (e.g. it's the main mesh, or nothing was hit)."""
+        if actor is None:
+            return None
+        for name, act in self.plotter.renderer.actors.items():
+            if act is actor:
+                return self._marker_refs.get(name)
+        return None
+
+    def _actor_name_for_ref(self, ref: tuple) -> str:
+        if ref[0] == "point":
+            return f"marker_{ref[1]}"
+        return f"wp_{ref[1]}_{ref[2]}"
+
+    def _marker_xyz(self, ref: tuple) -> list[float]:
+        kind, name, *rest = ref
+        if kind == "point":
+            return self.session.points[name]["xyz"]
+        if kind == "loop":
+            return self.session.loops[name]["xyz"][rest[0]]
+        return self.session.paths[name]["xyz"][rest[0]]
+
+    def _marker_vertex_id(self, ref: tuple) -> int:
+        kind, name, *rest = ref
+        if kind == "point":
+            return self.session.points[name]["vertex_id"]
+        if kind == "loop":
+            return self.session.loops[name]["vertex_ids"][rest[0]]
+        return self.session.paths[name]["vertex_ids"][rest[0]]
+
+    def _edit_label(self, ref: tuple) -> str:
+        if ref[0] == "point":
+            return ref[1]
+        kind_word = "loop" if ref[0] == "loop" else "path"
+        return f"{ref[1]} {kind_word} waypoint {ref[2] + 1}"
+
+    def _highlight_edit_selection(self, ref: tuple) -> None:
+        name, xyz = self._actor_name_for_ref(ref), self._marker_xyz(ref)
+        self._add_marker_sphere(name, xyz, EDIT_SELECT_COLOR, ref=ref, pickable=True)
+
+    def _unhighlight_edit_selection(self, ref: tuple) -> None:
+        name, xyz = self._actor_name_for_ref(ref), self._marker_xyz(ref)
+        self._add_marker_sphere(name, xyz, DONE_COLOR, ref=ref, pickable=True)
+
+    def _apply_edit_move(self, ref: tuple, vertex_id: int, xyz) -> None:
+        kind, name, *rest = ref
+        if kind == "point":
+            self.session.set_point(name, vertex_id, xyz)
+        elif kind == "loop":
+            data = self.session.loops[name]
+            data["vertex_ids"][rest[0]] = int(vertex_id)
+            data["xyz"][rest[0]] = [float(v) for v in xyz]
+        else:  # path
+            data = self.session.paths[name]
+            data["vertex_ids"][rest[0]] = int(vertex_id)
+            data["xyz"][rest[0]] = [float(v) for v in xyz]
+
+    def _on_pick_edit(self, point, picker) -> None:
+        actor = picker.GetActor()
+        ref = self._ref_for_actor(actor)
+
+        if self._edit_selected is None:
+            if ref is None:
+                return  # clicked the bare mesh with nothing selected - no-op
+            self._edit_selected = ref
+            self._highlight_edit_selection(ref)
+            self._refresh_status()
+            return
+
+        if ref is not None:
+            # Clicked a point instead of a destination - change (or, on a
+            # repeat click of the same one, cancel) the selection rather
+            # than treating that point's own position as a move target.
+            prior = self._edit_selected
+            self._unhighlight_edit_selection(prior)
+            self._edit_selected = None if ref == prior else ref
+            if self._edit_selected is not None:
+                self._highlight_edit_selection(self._edit_selected)
+            self._refresh_status()
+            return
+
+        if self._shift_held():
+            if not self.boundary.available:
+                print("Mesh has no open boundary edges to snap to.")
+                return
+            vertex_id = self.boundary.snap(point)
+        else:
+            vertex_id = picker.GetPointId()
+            if vertex_id is None or vertex_id < 0:
+                return
+        xyz = self.mesh.points[vertex_id]
+
+        ref = self._edit_selected
+        prior_vertex_id = self._marker_vertex_id(ref)
+        prior_xyz = list(self._marker_xyz(ref))
+        self._apply_edit_move(ref, vertex_id, xyz)
+        print(f"Moved {self._edit_label(ref)}.")
+        self._push_undo(
+            lambda r=ref, pvid=prior_vertex_id, pxyz=prior_xyz: self._undo_move(r, pvid, pxyz)
+        )
+        self._edit_selected = None
+        self._invalidate_computed_regions()
+        self._redraw_existing_landmarks()
+        self._refresh_status()
+        self._update_geodesics()
+
+    def _undo_move(self, ref: tuple, prior_vertex_id: int, prior_xyz) -> None:
+        self._apply_edit_move(ref, prior_vertex_id, prior_xyz)
+        self._redraw_existing_landmarks()
 
     def _push_undo(self, reverse: Callable[[], None]) -> None:
         self._undo_stack.append(reverse)
@@ -387,10 +527,12 @@ class LandmarkPickerWidget(QMainWindow):
                 print(f"Need at least 1 waypoint for {current.name} "
                       f"({len(self._loop_buffer)} placed).")
                 return
-            start = self.session.points[current.path_start]
-            end = self.session.points[current.path_end]
-            vertex_ids = [start["vertex_id"], *[v for v, _ in self._loop_buffer], end["vertex_id"]]
-            xyz_list = [start["xyz"], *[xyz for _, xyz in self._loop_buffer], end["xyz"]]
+            # Only the operator's own waypoints are stored - path_start/
+            # path_end are resolved fresh from session.points wherever the
+            # full path is needed (_path_vertex_ids), same as a loop's
+            # seed_points, so editing that landmark afterwards stays in sync.
+            vertex_ids = [v for v, _ in self._loop_buffer]
+            xyz_list = [xyz for _, xyz in self._loop_buffer]
             self.session.set_path(current.name, vertex_ids, xyz_list)
             self._draw_path_final(current.name)
 
@@ -428,6 +570,7 @@ class LandmarkPickerWidget(QMainWindow):
             return
         reverse = self._undo_stack.pop()
         reverse()
+        self._edit_selected = None  # the undone landmark may have been the selected one
         self._invalidate_computed_regions()
         self._refresh_status()
         self._update_geodesics()
@@ -441,6 +584,8 @@ class LandmarkPickerWidget(QMainWindow):
         self._loop_buffer = []
         self._full_loop_cache.clear()
         self._undo_stack.clear()
+        self._edit_selected = None
+        self._marker_refs.clear()
         self.index = 0
         self._invalidate_computed_regions()
         self._refresh_status()
@@ -581,19 +726,54 @@ class LandmarkPickerWidget(QMainWindow):
 
     # -- drawing: landmarks --------------------------------------------------
 
-    def _draw_point_marker(self, name: str, xyz, color: str) -> None:
-        self.plotter.add_points(
-            pv.PolyData([xyz]), color=color, point_size=14, render_points_as_spheres=True,
-            name=f"marker_{name}", pickable=False,
+    def _marker_radius(self) -> float:
+        return 0.006 * self.mesh.length
+
+    def _add_marker_sphere(self, actor_name: str, xyz, color: str, *, ref: tuple, pickable: bool) -> None:
+        """Draw a landmark/waypoint marker as an actual small 3D sphere
+        (not a screen-space point sprite) so it has real geometry a cell
+        picker can hit - a batched point-sprite actor with pickable=True
+        was previously tried for this and turned out not to be reliably
+        clickable. `ref` records what this marker represents, for
+        _ref_for_actor to resolve a pick back to it in edit mode."""
+        sphere = pv.Sphere(radius=self._marker_radius(), center=xyz, theta_resolution=12, phi_resolution=12)
+        self.plotter.add_mesh(
+            sphere, color=color, name=actor_name, pickable=pickable,
+            smooth_shading=True, specular=0.0,
         )
+        self._marker_refs[actor_name] = ref
+
+    def _edit_mode_active(self) -> bool:
+        return self.current is None
+
+    def _sync_marker_pickability(self) -> None:
+        """Every landmark/waypoint marker is only a valid edit-mode pick
+        target once all landmarks are placed - keep their actors' pickable
+        flag in sync with that, called after every action that could change
+        it (see _refresh_status)."""
+        pickable = self._edit_mode_active()
+        for actor_name in self._marker_refs:
+            actor = self.plotter.renderer.actors.get(actor_name)
+            if actor is not None:
+                actor.SetPickable(pickable)
+
+    def _draw_point_marker(self, name: str, xyz, color: str) -> None:
+        self._add_marker_sphere(f"marker_{name}", xyz, color, ref=("point", name), pickable=self._edit_mode_active())
         self.plotter.add_point_labels(
             [xyz], [name], name=f"label_{name}", font_size=20, text_color=color,
             shape=None, always_visible=False, pickable=False,
         )
 
+    def _clear_marker_actors_with_prefix(self, prefix: str) -> None:
+        for actor_name in [k for k in self._marker_refs if k.startswith(prefix)]:
+            self.plotter.remove_actor(actor_name)
+            self._marker_refs.pop(actor_name, None)
+
     def _clear_landmark_actors(self, name: str) -> None:
         for prefix in ("marker_", "label_", "loopline_"):
             self.plotter.remove_actor(f"{prefix}{name}")
+        self._marker_refs.pop(f"marker_{name}", None)
+        self._clear_marker_actors_with_prefix(f"wp_{name}_")
 
     def _smart_chain_polydata(self, vertex_ids: list[int], close: bool) -> pv.PolyData | None:
         """Build a drawable polyline through consecutive vertex ids, using a
@@ -621,6 +801,17 @@ class LandmarkPickerWidget(QMainWindow):
             ids = [*seed_ids, *ids]
         return ids
 
+    def _path_vertex_ids(self, name: str) -> list[int]:
+        """Full vertex id list for a finished path landmark, with
+        path_start/path_end resolved fresh from session.points (mirrors
+        _loop_vertex_ids) - session.paths only stores the operator's own
+        waypoints, so this always reflects those points' current position."""
+        spec = self.plan_by_name[name]
+        start = self.session.points[spec.path_start]
+        end = self.session.points[spec.path_end]
+        mid_ids = self.session.paths[name]["vertex_ids"]
+        return [start["vertex_id"], *mid_ids, end["vertex_id"]]
+
     def _draw_buffer_progress(self, name: str) -> None:
         """Preview the in-progress waypoints of a loop or path landmark.
         For a path, the chain is anchored to path_start; for a seeded loop
@@ -644,20 +835,19 @@ class LandmarkPickerWidget(QMainWindow):
             chain_ids = [*seed_ids, *ids]
         chain = self._smart_chain_polydata(chain_ids, close=False)
         if chain is not None:
-            self.plotter.add_mesh(chain, color=LOOP_COLOR, line_width=3, name=f"loopline_{name}")
+            self.plotter.add_mesh(chain, color=LOOP_COLOR, line_width=3, name=f"loopline_{name}", pickable=False)
 
     def _draw_loop_final(self, name: str) -> None:
+        self.plotter.remove_actor(f"marker_{name}")  # drop the in-progress buffer marker, if any
         loop = self.session.loops[name]
         full_ids = self._loop_vertex_ids(name)
         pts = loop["xyz"]  # markers only for the operator's own waypoints - seed points already have their own
         chain = self._smart_chain_polydata(full_ids, close=True)
         if chain is not None:
-            self.plotter.add_mesh(chain, color=DONE_COLOR, line_width=4, name=f"loopline_{name}")
-        if pts:
-            self.plotter.add_points(
-                pv.PolyData(pts), color=DONE_COLOR, point_size=10, render_points_as_spheres=True,
-                name=f"marker_{name}", pickable=False,
-            )
+            self.plotter.add_mesh(chain, color=DONE_COLOR, line_width=4, name=f"loopline_{name}", pickable=False)
+        pickable = self._edit_mode_active()
+        for idx, xyz in enumerate(pts):
+            self._add_marker_sphere(f"wp_{name}_{idx}", xyz, DONE_COLOR, ref=("loop", name, idx), pickable=pickable)
         full_xyz = self.mesh.points[full_ids]
         centroid = full_xyz.mean(axis=0).tolist()
         self.plotter.add_point_labels(
@@ -666,18 +856,16 @@ class LandmarkPickerWidget(QMainWindow):
         )
 
     def _draw_path_final(self, name: str) -> None:
+        self.plotter.remove_actor(f"marker_{name}")  # drop the in-progress buffer marker, if any
         data = self.session.paths[name]
-        ids = data["vertex_ids"]
-        pts = data["xyz"]
+        ids = self._path_vertex_ids(name)
+        pts = data["xyz"]  # operator's own waypoints only - path_start/path_end already have their own markers
         chain = self._smart_chain_polydata(ids, close=False)
         if chain is not None:
-            self.plotter.add_mesh(chain, color=DONE_COLOR, line_width=4, name=f"loopline_{name}")
-        interior_pts = pts[1:-1]  # exclude the shared start/end points (already marked)
-        if interior_pts:
-            self.plotter.add_points(
-                pv.PolyData(interior_pts), color=DONE_COLOR, point_size=10,
-                render_points_as_spheres=True, name=f"marker_{name}", pickable=False,
-            )
+            self.plotter.add_mesh(chain, color=DONE_COLOR, line_width=4, name=f"loopline_{name}", pickable=False)
+        pickable = self._edit_mode_active()
+        for idx, xyz in enumerate(pts):
+            self._add_marker_sphere(f"wp_{name}_{idx}", xyz, DONE_COLOR, ref=("path", name, idx), pickable=pickable)
 
     def _clear_loop_actors(self, name: str) -> None:
         self.plotter.remove_actor(f"marker_{name}")
@@ -825,7 +1013,15 @@ class LandmarkPickerWidget(QMainWindow):
                 details.append(f"{n} point(s) placed (need >= {n_needed}) - press 'Finish loop/path'")
         else:
             details.append("Press 'Compute regions', then 'Confirm & Close'.")
-            details.append("To move a placed landmark, press 'Undo' and place it again.")
+            if self._edit_selected is None:
+                details.append(
+                    "Right-click a landmark point or waypoint to select it for moving."
+                )
+            else:
+                details.append(
+                    f"Selected {self._edit_label(self._edit_selected)} (gold) - right-click "
+                    "a new location to move it there (shift+right-click to snap to a rim)."
+                )
         self.details_label.setText("\n".join(details))
 
         lines = [f"{self.chamber} landmarks:"]
@@ -836,6 +1032,7 @@ class LandmarkPickerWidget(QMainWindow):
         self.checklist_label.setText("\n".join(lines))
 
         self._update_hint_image()
+        self._sync_marker_pickability()
 
     def _update_hint_image(self) -> None:
         """Show a reference image in the right-hand panel, tracking the
