@@ -1,9 +1,12 @@
 """In-memory state for the landmarks placed during one landmark-picking run.
 
-No persistence: a WIP run is a single place-everything / confirm / close
-action, so there is nothing to save to disk or resume across runs (unlike
-the original standalone-script version of this tool, which serialized a
-session to JSON so it could be resumed later)."""
+A WIP run is a single place-everything / confirm / close action, so
+`LandmarkState` itself never touches disk. `to_dict`/`from_dict` are a
+pure data round-trip only, with no file I/O - the debug-mode CLI runner
+(`wips/atrial_regionalisation/main.py`) uses them to save/reload a session
+as JSON purely as a debugging convenience (so landmarks don't have to be
+re-clicked on every debug run); the EP Workbench WIP flow never calls
+them."""
 
 from __future__ import annotations
 
@@ -39,3 +42,15 @@ class LandmarkState:
 
     def has(self, name: str) -> bool:
         return name in self.points or name in self.loops or name in self.paths
+
+    def to_dict(self) -> dict:
+        return {"chamber": self.chamber, "points": self.points, "loops": self.loops, "paths": self.paths}
+
+    @classmethod
+    def from_dict(cls, data: dict) -> "LandmarkState":
+        return cls(
+            chamber=data["chamber"],
+            points=data.get("points", {}),
+            loops=data.get("loops", {}),
+            paths=data.get("paths", {}),
+        )

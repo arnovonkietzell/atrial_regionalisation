@@ -46,15 +46,20 @@ which python #save this env python path for later
 
 4. Running the WIP outside EP Workbench:
 
-To run in `debug` mode, open the WIP's
-`main.py` and edit `mesh_path` / `root_dir` / `chamber` to your preferred
-input mesh and output directory, then:
+Debug mode takes the input mesh path and chamber as command-line
+arguments - `root_dir` and the case name are inferred from the mesh
+path (its parent directory and filename stem):
 
 ```bash
 conda activate ar
 cd atrial_regionalisation
-python -m wips.atrial_regionalisation.main
+python -m wips.atrial_regionalisation.main /path/to/mesh.vtk LA
 ```
+
+Debug mode also saves/reloads the placed landmarks as a JSON file
+alongside the input mesh, purely to aid debugging, so a debug run
+doesn't require re-clicking every landmark from scratch. This never
+happens in the real EP Workbench WIP flow.
 
 ## Overview
 

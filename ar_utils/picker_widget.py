@@ -267,6 +267,18 @@ class LandmarkPickerWidget(QMainWindow):
             return None
         return self.plan[self.index]
 
+    def load_session(self, session: LandmarkState) -> None:
+        """Replace the current (empty) session with a previously captured
+        one and bring the rest of the window's state in line with it -
+        `main.py`'s debug-mode runner uses this to restore a session saved
+        as JSON on a previous run, purely as a debugging convenience."""
+        self.session = session
+        self.index = 0
+        self._advance_to_next_pending()
+        self._redraw_existing_landmarks()
+        self._refresh_status()
+        self._update_geodesics()
+
     # -- picking callbacks --------------------------------------------------
 
     def _on_pick(self, point, picker) -> None:
