@@ -6,21 +6,29 @@ Three kinds of boundary are distinguished:
 
 - Interior geodesics (`LA_EDGES`): a plain shortest-path line between two
   landmarks across the open atrial surface.
-- Boundary arcs (`LA_BOUNDARY_ARC_EDGES`, `ArcEdge`): the two landmarks both
-  sit on the same open mesh boundary loop (e.g. the mitral annulus rim), and
-  the segment border is simply that rim between them - not a geodesic, since
-  the rim itself already is the anatomical border. Normally the shorter of
-  the two possible arcs; `ArcEdge(whole_loop=True)` instead tags the entire
-  loop (both arcs combined) for a two-point hole shared by two segments
-  (see the IVC entry in RA_BOUNDARY_ARC_EDGES) - neither arc alone can be
-  reliably attributed to one segment or the other (tried picking by length
-  and by nearest landmark; both turned out not to be anatomically
-  meaningful and flipped between sessions), but that's fine: each segment
-  already has other unique tags that identify it, so "touches this hole at
-  all" is all the IVC tag needs to contribute.
+- Boundary arcs (`LA_BOUNDARY_ARC_EDGES`, `ArcEdge`): normally the two
+  landmarks both sit on the same open mesh boundary loop (e.g. the mitral
+  annulus rim), and the segment border is simply that rim between them -
+  not a geodesic, since the rim itself already is the anatomical border.
+  Whether that actually holds depends on the mesh, though (it may not be
+  clipped open at every valve/vein), so this is decided per pair at
+  segmentation time, not declared here: if both landmarks are on the same
+  boundary loop, the border is the (shorter) rim arc between them; if not,
+  it falls back to a plain geodesic instead - see segmentation.py.
 - Loop composite paths (`LA_LOOP_PATHS`): a border that runs from a point,
   to the nearest point on a closed appendage-neck loop, along the loop, to
   the nearest-to-the-other-point loop vertex, then on to the other point.
+
+RA's IVC orifice doesn't fit the two-named-point `ArcEdge` pattern (unlike
+SVC's three-point S/O/L loop, it only has two named points, K and N, so
+there's no reliable way to attribute one of the two possible arcs between
+them to one specific neighbouring segment rather than the other - tried
+picking by arc length and by nearest landmark, neither was anatomically
+meaningful and both flipped between sessions). Instead it's a `landmarks.py`
+"loop" landmark (`KN_loop`) seeded from K and N with 1+ extra operator-
+clicked waypoints closing the ring back to K, exactly like `LAA_neck` -
+see the `RA_SEGMENT_BORDERS` comment below for how that resolves segments
+10 and 14's shared border either way.
 
 RA's tables are derived from connectivity supplied directly by the user
 (who cross-checked it against the reference implementation's boundary
@@ -35,22 +43,18 @@ from dataclasses import dataclass
 
 @dataclass(frozen=True)
 class ArcEdge:
-    """A segment boundary that walks a mesh open-boundary rim between two
-    landmarks on the same loop, rather than a Dijkstra geodesic.
-
-    `whole_loop=True` tags every vertex of the entire loop (both possible
-    arcs between a and b) instead of picking just one - for a two-point
-    hole (e.g. the IVC) shared by two segments, where there's no reliable
-    way to attribute one specific arc to one specific segment. Each segment
-    still gets identified correctly via its other, unique tags; the shared
-    tag just confirms "touches this hole."
+    """A segment boundary between two landmarks that sit on the same mesh
+    open-boundary rim - walked along that rim (the shorter arc) rather
+    than a Dijkstra geodesic. Declaring this pair here only says "these two
+    are adjacent on a boundary when the mesh has one there"; whether they
+    actually are (and so whether this resolves to a rim arc or falls back
+    to a geodesic) is checked at segmentation time - see segmentation.py.
 
     `name` overrides the default `f"{a}_{b}"` curve name.
     """
 
     a: str
     b: str
-    whole_loop: bool = False
     name: str | None = None
 
     @property
@@ -68,8 +72,9 @@ LA_EDGES: list[tuple[str, str]] = [
     ("H", "B"),  # segment 6 infero-posterior border / segment 7 lateral border
 ]
 
-# Both landmarks sit on the same detected mesh boundary loop (the mitral
-# annulus rim); the border is that rim arc, not a Dijkstra shortest path.
+# Normally both landmarks sit on the same detected mesh boundary loop (the
+# mitral annulus rim), and the border is that rim arc; falls back to a
+# geodesic per-pair if not - see the ArcEdge/module docstrings.
 LA_BOUNDARY_ARC_EDGES: list[ArcEdge] = [
     ArcEdge("E", "F"),  # segment 4 apical border (mitral annulus 9-1 o'clock)
     ArcEdge("F", "H"),  # segment 6 apical border (mitral annulus 1-4 o'clock)
@@ -104,21 +109,11 @@ RA_EDGES: list[tuple[str, str]] = [
     ("V", "J"),  # segment 14 / segment 15
 ]
 
-# Both landmarks sit on the same detected mesh boundary loop; the border is
-# that rim arc, not a Dijkstra shortest path. Tricuspid annulus, clockwise
-# from 1 o'clock: M -> V -> T -> U -> M. SVC orifice: S -> O -> L -> S.
-#
-# IVC only has two defining points (K, N - no third point the way SVC has
-# S/O/L), so its two bordering segments (10 and 14) can't each get their own
-# named arc the way the other holes do, and no reliable way was found to
-# attribute one specific arc to one specific segment (tried an extra
-# waypoint-based path, picking by raw arc length, and anchoring to the
-# nearest landmark - all either added an unwanted click or turned out not
-# to be anatomically meaningful, flipping between sessions). Instead, the
-# *entire* IVC rim (both arcs together) is tagged once as "K_N" and shared
-# by both segments 10 and 14 - each is still identified unambiguously by
-# its other unique tags, so all the shared tag needs to confirm is "this
-# piece touches the IVC hole," which is true for both sides equally.
+# Normally both landmarks sit on the same detected mesh boundary loop; the
+# border is that rim arc, falling back to a geodesic per-pair if not.
+# Tricuspid annulus, clockwise from 1 o'clock: M -> V -> T -> U -> M. SVC
+# orifice: S -> O -> L -> S. The IVC orifice (K/N) is a `KN_loop` landmark
+# instead - see the module and RA_SEGMENT_BORDERS docstrings.
 RA_BOUNDARY_ARC_EDGES: list[ArcEdge] = [
     ArcEdge("U", "M"),  # segment 13 apical border (tricuspid annulus 11-1 o'clock)
     ArcEdge("M", "V"),  # segment 15 apical border (tricuspid annulus 1-5 o'clock)
@@ -127,7 +122,6 @@ RA_BOUNDARY_ARC_EDGES: list[ArcEdge] = [
     ArcEdge("S", "O"),  # segment 11 border (SVC orifice, anterior-lateral)
     ArcEdge("O", "L"),  # segment 10 border (SVC orifice, lateral-septal)
     ArcEdge("L", "S"),  # segment 13 border (SVC orifice, septal-anterior)
-    ArcEdge("K", "N", whole_loop=True),  # segment 10 AND segment 14 border (IVC orifice, whole rim)
 ]
 
 RA_LOOP_PATHS: list[tuple[str, str, str]] = []  # RA has no appendage-neck loop to route through
@@ -168,6 +162,15 @@ def loop_path_name(a: str, loop_name: str, b: str) -> str:
 # to where segment 4 and 6 already meet, leaving segment 6 to wrap around
 # most of the appendage base), so segment 6 alone also expects "LAA_neck"
 # as well as the composite path.
+#
+# Segment 16 only comes into existence if the E-F-H-I-E loop isn't (fully)
+# on the mesh's own mitral-annulus boundary: when every one of its edges is
+# a true rim arc, the loop retraces the boundary of an actual hole, so
+# there's no tissue "inside" it for a component to match - segment 16
+# simply never gets any cells. When one or more edges fall back to a
+# geodesic instead (see the ArcEdge/module docstrings), the loop encloses
+# whatever real tissue lies between the clicked points and the true rim,
+# and that patch becomes segment 16.
 LA_SEGMENT_BORDERS: dict[int, frozenset[str]] = {
     1: frozenset({edge_name("A", "B"), "LPV_antrum_outer"}),
     2: frozenset({edge_name("C", "D"), "RPV_antrum_outer"}),
@@ -178,26 +181,59 @@ LA_SEGMENT_BORDERS: dict[int, frozenset[str]] = {
                   loop_path_name("A", "LAA_neck", "F"), "LAA_neck"}),
     7: frozenset({edge_name("B", "D"), edge_name("H", "I"), edge_name("H", "B"), edge_name("D", "I")}),
     8: frozenset({edge_name("I", "E"), edge_name("E", "C"), edge_name("D", "I"), "RPV_antrum_outer"}),
+    16: frozenset({edge_name("E", "F"), edge_name("F", "H"), edge_name("H", "I"), edge_name("I", "E")}),
 }
 
-# Segments 10 and 14 both expect "K_N" (see RA_BOUNDARY_ARC_EDGES above,
-# whole_loop=True) - the IVC's whole rim, shared by both, since neither of
-# its two arcs can be reliably attributed to one segment or the other. Each
-# is still identified unambiguously via its own other, unique tags.
+# Segments 10 and 14 both expect "KN_loop" - the whole IVC orifice loop
+# (K, N, and 1+ operator-clicked waypoints closing back to K - see
+# landmarks.py), shared by both, since neither of its arcs can be reliably
+# attributed to one segment or the other on its own. Each is still
+# identified unambiguously via its own other, unique tags.
+#
+# Segment 18 mirrors segment 16 above: if K, N, and every waypoint all lie
+# on the mesh's own IVC boundary, KN_loop retraces an actual hole and
+# encloses no tissue, so segment 18 never gets any cells; if one or more
+# aren't on that boundary, the loop encloses whatever real tissue lies
+# between the clicked points and the true orifice rim instead.
 RA_SEGMENT_BORDERS: dict[int, frozenset[str]] = {
     9: frozenset({edge_name("M", "L"), edge_name("L", "K"), edge_name("K", "J"), edge_name("J", "M")}),
-    10: frozenset({edge_name("L", "K"), edge_name("K", "N"), edge_name("N", "O"), edge_name("O", "L")}),
+    10: frozenset({edge_name("L", "K"), "KN_loop", edge_name("N", "O"), edge_name("O", "L")}),
     11: frozenset({edge_name("N", "O"), edge_name("S", "O"), edge_name("S", "P"),
                     edge_name("P", "Q"), edge_name("Q", "N")}),
     12: frozenset({edge_name("Q", "N"), edge_name("N", "T"), edge_name("T", "U"), edge_name("Q", "U")}),
     13: frozenset({edge_name("L", "S"), edge_name("S", "P"), edge_name("P", "Q"),
                     edge_name("Q", "U"), edge_name("U", "M"), edge_name("M", "L")}),
-    14: frozenset({edge_name("K", "N"), edge_name("K", "J"), edge_name("V", "J"),
+    14: frozenset({"KN_loop", edge_name("K", "J"), edge_name("V", "J"),
                     edge_name("V", "T"), edge_name("N", "T")}),
     15: frozenset({edge_name("J", "M"), edge_name("M", "V"), edge_name("V", "J")}),
+    17: frozenset({edge_name("U", "M"), edge_name("M", "V"), edge_name("V", "T"), edge_name("T", "U")}),
+    18: frozenset({"KN_loop"}),
+    19: frozenset({edge_name("S", "O"), edge_name("O", "L"), edge_name("L", "S")}),
 }
 
 _SEGMENT_BORDERS = {"LA": LA_SEGMENT_BORDERS, "RA": RA_SEGMENT_BORDERS}
+
+# Segments whose match only requires the component's border set to be a
+# non-empty *subset* of the expected one, not an exact match - unlike the
+# "real" 1-15 segments (partial evidence there could just as easily mean a
+# genuinely broken/incomplete cut, so those stay strict exact-match only).
+#
+# 16 (EFHI), 17 (UMVT) and 19 (LOS) each combine several separately-named
+# arc curves (e.g. 16's E_F/F_H/H_I/I_E) into one segment; if only some of
+# a boundary loop's landmarks weren't snapped, the leftover tissue near
+# each one is often a separate small sliver bordering only its own
+# neighbouring tag(s), not the whole loop's tags at once - it's still
+# unambiguously "not part of any real segment" either way.
+#
+# 5 (LAA_neck) and 18 (KN_loop) are listed here too for the same
+# conceptual reason (both are "whatever a single loop curve encloses"),
+# even though it makes no practical difference for them: each has only
+# *one* tag in its expected set, and a single-element set's only
+# non-empty subset is itself, so subset and exact matching are already
+# identical there.
+LA_SUBSET_MATCH_SEGMENTS: frozenset[int] = frozenset({5, 16})
+RA_SUBSET_MATCH_SEGMENTS: frozenset[int] = frozenset({17, 18, 19})
+_SUBSET_MATCH_SEGMENTS = {"LA": LA_SUBSET_MATCH_SEGMENTS, "RA": RA_SUBSET_MATCH_SEGMENTS}
 
 
 def get_segment_borders(chamber: str) -> dict[int, frozenset[str]]:
@@ -205,6 +241,13 @@ def get_segment_borders(chamber: str) -> dict[int, frozenset[str]]:
     if chamber == "BOTH":
         return {**LA_SEGMENT_BORDERS, **RA_SEGMENT_BORDERS}
     return dict(_SEGMENT_BORDERS.get(chamber, {}))
+
+
+def get_subset_match_segments(chamber: str) -> frozenset[int]:
+    chamber = chamber.upper()
+    if chamber == "BOTH":
+        return LA_SUBSET_MATCH_SEGMENTS | RA_SUBSET_MATCH_SEGMENTS
+    return _SUBSET_MATCH_SEGMENTS.get(chamber, frozenset())
 
 
 def get_edges(chamber: str) -> list[tuple[str, str]]:

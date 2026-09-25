@@ -89,13 +89,23 @@ def nearest_on_point_list(vertex_ids: list[int], xyz_list, target_xyz) -> int:
     return int(vertex_ids[int(np.argmin(d))])
 
 
-def dense_chain(mesh: pv.PolyData, clicked_ids: list[int], close: bool) -> list[int]:
+def smart_chain(mesh: pv.PolyData, boundary: "BoundarySnapper", clicked_ids: list[int], close: bool) -> list[int]:
     """Expand a sparse chain of clicked vertex ids into the full, densely
     ordered list of mesh vertex ids along the *actual drawn* curve - i.e.
-    the chained geodesics between consecutive clicked points, not just the
-    clicked points themselves. `close=True` treats it as a closed loop
+    the chained connections between consecutive clicked points, not just
+    the clicked points themselves. `close=True` treats it as a closed loop
     (e.g. the appendage neck); `close=False` as an open path (e.g. an
-    antrum-outer path), keeping both endpoints."""
+    antrum-outer path), keeping both endpoints.
+
+    For each consecutive pair of clicked points, uses the shorter arc along
+    a shared detected mesh boundary loop if both are on the same one -
+    falling back to a Dijkstra geodesic otherwise.
+
+    This is what lets a loop/path curve (EFHI, UMVT, LOS, KN_loop, LAA_neck,
+    an antrum-outer path, ...) behave like a rim arc wherever its points
+    are actually snapped to a boundary, and a plain cut wherever they
+    aren't, without the caller needing to know in advance which each
+    segment will be - see segmentation.py."""
     n = len(clicked_ids)
     if n < 2:
         return list(clicked_ids)
@@ -108,7 +118,12 @@ def dense_chain(mesh: pv.PolyData, clicked_ids: list[int], close: bool) -> list[
     for a, b in pairs:
         if a == b:
             continue
-        seg_ids = mesh.geodesic(a, b).point_data["vtkOriginalPointIds"].tolist()
+        loop_a = boundary.loop_containing(a)
+        loop_b = boundary.loop_containing(b)
+        if loop_a is not None and loop_a == loop_b:
+            seg_ids = arc_between(loop_a, a, b)
+        else:
+            seg_ids = mesh.geodesic(a, b).point_data["vtkOriginalPointIds"].tolist()
         full.extend(seg_ids[:-1])  # drop last point: shared with the next segment's start
     if not close:
         full.append(clicked_ids[-1])

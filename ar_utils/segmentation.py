@@ -1,10 +1,24 @@
 """Cell-based region labeling.
 
 Every drawn segment-boundary curve is expanded to its dense, mesh-exact
-vertex sequence, then used to cut the mesh's cell-adjacency (dual) graph.
+vertex sequence. Each *edge* of that sequence is then independently
+classified by whether it actually has two adjacent cells (a real interior
+edge - cut the cell-adjacency (dual) graph there, tagging both resulting
+sides) or only one (an open mesh boundary edge - a hole has nothing on its
+far side to cut, so its vertices are tagged directly, catching whichever
+cells touch them on whichever side has real tissue). A curve whose
+landmarks are properly snapped to a valve/vein rim ends up entirely the
+second kind, walking that rim exactly like before; a curve whose landmarks
+aren't on a detected boundary (the mesh may not be clipped open there)
+falls back to the first kind, a plain geodesic - see geometry.smart_chain.
+
 The resulting connected pieces are matched to segment numbers purely by
 which curves border them - no spatial seed guessing required, since each
-curve already carries the identity of the two segments it separates.
+curve already carries the identity of the two segments it separates. A
+component whose curve set doesn't match a "real" segment cleanly can still
+match one of the fallback segments (16-19) that only exist to catch
+leftover tissue enclosed when a boundary loop wasn't fully on the rim -
+see the LA_SEGMENT_BORDERS/RA_SEGMENT_BORDERS comments in geodesics.py.
 
 A cell gets label 0 if it falls in a piece that didn't match any segment
 cleanly (topology incomplete, or chamber not fully landmarked) - never a
@@ -19,8 +33,8 @@ import numpy as np
 from scipy.sparse import coo_matrix
 from scipy.sparse.csgraph import connected_components
 
-from .geodesics import edge_name, get_segment_borders, loop_path_name
-from .geometry import arc_between, dense_chain, nearest_on_point_list
+from .geodesics import edge_name, get_segment_borders, get_subset_match_segments, loop_path_name
+from .geometry import arc_between, nearest_on_point_list, smart_chain
 
 
 def _iterate_cells(mesh) -> list[list[int]]:
@@ -45,12 +59,17 @@ def _mesh_edge_to_cells(cells: list[list[int]]) -> dict[frozenset, list[int]]:
     return edge_cells
 
 
-def collect_curves(app) -> tuple[dict[str, list[int]], set[str]]:
+def collect_curves(app) -> dict[str, list[int]]:
     """Collect every drawn boundary curve as {name: dense ordered vertex
-    ids}, plus the subset of names that are mesh-boundary rim arcs (which
-    only ever touch one cell, so they aren't real graph cuts - they're used
-    only as an identifying signal)."""
+    ids}. Each segment of every multi-point curve (boundary_arc_edges,
+    loops, paths) independently resolves to a rim arc if its two endpoints
+    are on the same detected mesh boundary loop, or a plain geodesic
+    otherwise (see geometry.smart_chain) - `label_regions` decides, per
+    resulting edge (not per curve), whether that means a real graph cut or
+    a rim-touch tag, since an open boundary edge only ever touches one
+    cell and so can't be "cut" in the usual two-sided sense."""
     mesh = app.mesh
+    boundary = app.boundary
     curves: dict[str, list[int]] = {}
 
     for a, b in app.edges:
@@ -58,23 +77,20 @@ def collect_curves(app) -> tuple[dict[str, list[int]], set[str]]:
         seg = mesh.geodesic(pa["vertex_id"], pb["vertex_id"])
         curves[edge_name(a, b)] = seg.point_data["vtkOriginalPointIds"].tolist()
 
-    rim_names: set[str] = set()
     for arc_edge in app.boundary_arc_edges:
         a, b = arc_edge.a, arc_edge.b
         pa, pb = app.session.points[a], app.session.points[b]
-        loop_a = app.boundary.loop_containing(pa["vertex_id"])
-        loop_b = app.boundary.loop_containing(pb["vertex_id"])
         name = arc_edge.curve_name
-        if loop_a is None or loop_a != loop_b:
-            print(f"Warning: {a} and {b} are not on the same mesh boundary rim; "
-                  f"'{name}' will be missing from the border signature (likely a "
-                  "mis-click on the wrong valve/vein rim).")
-            continue
-        if arc_edge.whole_loop:
-            curves[name] = loop_a
-        else:
+        loop_a = boundary.loop_containing(pa["vertex_id"])
+        loop_b = boundary.loop_containing(pb["vertex_id"])
+        if loop_a is not None and loop_a == loop_b:
             curves[name] = arc_between(loop_a, pa["vertex_id"], pb["vertex_id"])
-        rim_names.add(name)
+        else:
+            curves[name] = mesh.geodesic(
+                pa["vertex_id"], pb["vertex_id"]
+            ).point_data["vtkOriginalPointIds"].tolist()
+            print(f"{a} and {b} are not on the same mesh boundary rim; "
+                  f"'{name}' will be a geodesic instead of a rim arc.")
 
     for a, loop_name, b in app.loop_paths:
         pa, pb = app.session.points[a], app.session.points[b]
@@ -95,16 +111,24 @@ def collect_curves(app) -> tuple[dict[str, list[int]], set[str]]:
     # real curves: they'd tag vertices that a *new* curve covering the same
     # territory also touches, incorrectly turning it into a junction.
     for name, data in app.session.loops.items():
-        if app.plan_by_name.get(name, None) is None or app.plan_by_name[name].kind != "loop":
+        spec = app.plan_by_name.get(name)
+        if spec is None or spec.kind != "loop":
             continue
-        curves[name] = dense_chain(mesh, data["vertex_ids"], close=True)
+        vertex_ids = data["vertex_ids"]
+        if spec.seed_points:
+            # e.g. KN_loop: prepend K and N's own already-placed vertices
+            # before the operator's own clicked waypoints, closing back to
+            # K (the first seed point) rather than to the first waypoint.
+            seed_vertex_ids = [app.session.points[n]["vertex_id"] for n in spec.seed_points]
+            vertex_ids = [*seed_vertex_ids, *vertex_ids]
+        curves[name] = smart_chain(mesh, boundary, vertex_ids, close=True)
 
     for name, data in app.session.paths.items():
         if app.plan_by_name.get(name, None) is None or app.plan_by_name[name].kind != "path":
             continue
-        curves[name] = dense_chain(mesh, data["vertex_ids"], close=False)
+        curves[name] = smart_chain(mesh, boundary, data["vertex_ids"], close=False)
 
-    return curves, rim_names
+    return curves
 
 
 @dataclass
@@ -129,8 +153,9 @@ def label_regions(app) -> tuple[np.ndarray, list[ComponentMatch], dict]:
     n_cells = len(cells)
     edge_cells = _mesh_edge_to_cells(cells)
 
-    curves, rim_names = collect_curves(app)
+    curves = collect_curves(app)
     segment_borders = get_segment_borders(app.chamber)
+    subset_match_segments = get_subset_match_segments(app.chamber)
 
     # A loop-composite path (e.g. A_LAA_neck_F) physically reuses some of the
     # same mesh edges as the loop it routes through (e.g. LAA_neck), since
@@ -138,10 +163,12 @@ def label_regions(app) -> tuple[np.ndarray, list[ComponentMatch], dict]:
     # tag those shared edges, which breaks exact-match border comparison for
     # segments on the composite's side. The composite name is the more
     # specific identity for that stretch, so it wins: tag composite paths
-    # first, then skip any edge they've already claimed when tagging the
-    # plain loops/edges.
+    # first (always as interior cuts - a composite never touches a real
+    # mesh boundary edge), then skip any edge they've already claimed when
+    # tagging everything else.
     composite_names = {loop_path_name(a, loop, b) for a, loop, b in app.loop_paths}
     cut_edge_tags: dict[frozenset, set[str]] = {}
+    rim_vertex_tags: dict[int, set[str]] = {}
     claimed_edges: set[frozenset] = set()
     for name in composite_names:
         if name not in curves:
@@ -150,19 +177,30 @@ def label_regions(app) -> tuple[np.ndarray, list[ComponentMatch], dict]:
             edge = frozenset((u, v))
             cut_edge_tags.setdefault(edge, set()).add(name)
             claimed_edges.add(edge)
+
+    # Every other curve is classified per *edge*, not per curve: an edge
+    # with two adjacent cells is a real interior cut (tag both sides, once
+    # they're known to differ - see component_cut_borders below); an edge
+    # with only one (an open mesh boundary edge, since that's a hole with
+    # nothing on its far side) can't be "cut" in that two-sided sense at
+    # all, so its vertices are tagged directly instead, catching whichever
+    # cells actually touch them (component_rim_borders below). This is what
+    # lets one curve (e.g. KN_loop) be a rim arc along some stretches and a
+    # real cut along others, depending on where the mesh actually has an
+    # open boundary - see geometry.smart_chain and the module docstring.
     for name, ids in curves.items():
-        if name in rim_names or name in composite_names:
+        if name in composite_names:
             continue
         for u, v in zip(ids, ids[1:]):
             edge = frozenset((u, v))
             if edge in claimed_edges:
                 continue
-            cut_edge_tags.setdefault(edge, set()).add(name)
-
-    rim_vertex_tags: dict[int, set[str]] = {}
-    for name in rim_names:
-        for v in curves[name]:
-            rim_vertex_tags.setdefault(v, set()).add(name)
+            adj_cells = edge_cells.get(edge)
+            if adj_cells and len(adj_cells) == 2:
+                cut_edge_tags.setdefault(edge, set()).add(name)
+            else:
+                rim_vertex_tags.setdefault(u, set()).add(name)
+                rim_vertex_tags.setdefault(v, set()).add(name)
 
     # Vertices touched by 2+ distinct curves (every named landmark, plus any
     # point where a composite path meets a loop) are junctions: only the
@@ -175,9 +213,9 @@ def label_regions(app) -> tuple[np.ndarray, list[ComponentMatch], dict]:
     #
     # A single curve can also revisit the same vertex twice without a
     # second curve ever being involved: a loop or multi-waypoint path is
-    # built by chaining Dijkstra geodesics between consecutive waypoints
-    # (see geometry.dense_chain), and if two non-adjacent segments of that
-    # chain happen to cross - more likely the sparser the waypoints, since
+    # built by chaining Dijkstra geodesics (or rim arcs) between consecutive
+    # waypoints (see geometry.smart_chain), and if two non-adjacent segments
+    # of that chain happen to cross - more likely the sparser the waypoints, since
     # each geodesic then has more freedom to bow away from the intended
     # route - only the mesh edges belonging to *those two segments* get cut
     # at the crossing vertex, not necessarily its whole edge ring. Counting
@@ -267,7 +305,15 @@ def label_regions(app) -> tuple[np.ndarray, list[ComponentMatch], dict]:
         best_seg = max(candidates, key=candidates.get) if candidates else 0
         best_score = candidates.get(best_seg, -1)
         expected = segment_borders.get(best_seg, frozenset())
-        exact = best_score == len(expected) and borders == expected
+        if best_seg in subset_match_segments:
+            # See geodesics.get_subset_match_segments: these accept any
+            # non-empty subset of their expected tag set, not just an
+            # exact match - real segments (not in this set) stay strict
+            # exact-match only, since partial evidence there could just as
+            # easily mean a genuinely broken/incomplete cut.
+            exact = len(borders) > 0 and borders <= expected
+        else:
+            exact = best_score == len(expected) and borders == expected
         if exact:
             cell_labels[comp_labels == comp_id] = best_seg
         report.append(ComponentMatch(

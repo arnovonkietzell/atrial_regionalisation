@@ -10,10 +10,15 @@ Usage
 -----
 Right click        Place the current landmark at the nearest visible mesh
                     vertex. (Left click is left free for rotating the
-                    camera.) Landmarks that must sit on a valve/vein
-                    orifice rim (the "boundary" landmarks) snap to the
-                    nearest point on that open mesh edge instead of the
-                    raw click location.
+                    camera.)
+Shift+right click  Same, but snap to the nearest point on an open mesh
+                    boundary (a valve/vein orifice rim) instead of the
+                    raw click location. Available for every landmark and
+                    waypoint, not just ones that are normally on a rim -
+                    segmentation checks which points actually ended up on
+                    a boundary for itself, rather than assuming from the
+                    landmark, since that depends on how the mesh was
+                    clipped (see segmentation.py).
 Finish loop/path    Finish the current loop / path landmark. [N]
 Undo                Undo the last action - a placed point or a finished
                     loop/path, whichever happened most recently. To move
@@ -59,7 +64,7 @@ from PyQt5.QtWidgets import (
 from pyvistaqt import QtInteractor
 
 from .geodesics import get_boundary_arc_edges, get_edges, get_loop_paths
-from .geometry import BoundarySnapper, arc_between, dense_chain, nearest_on_point_list
+from .geometry import BoundarySnapper, arc_between, nearest_on_point_list, smart_chain
 from .hints import final_image_path_for, image_path_for
 from .landmarks import LandmarkSpec, get_landmark_plan
 from .session import LandmarkState
@@ -69,15 +74,21 @@ LOOP_COLOR = "orange"
 DONE_COLOR = "seagreen"
 GEODESIC_COLOR = "dodgerblue"
 
-# One fixed colour per label, index = label value, covering the full 1-15
-# range so LA (1-8), RA (9-15), and a future "both" chamber (1-15) all get
-# a complete, consistent legend regardless of which subset is present in a
-# given mesh. Index 0 (unmatched/unlabelled) is a flat light grey, kept
-# visually distinct from every real segment colour. 1-15 are Sasha
-# Trubetskoy's "20 distinct colours" set (a hand-tuned categorical palette,
-# not an evenly-spaced hue wheel) - chosen for maximum contrast between
-# neighbouring labels rather than smooth/pretty transitions, which is what
-# actually matters when comparing adjacent regions on the mesh.
+# One fixed colour per label, index = label value, covering the full 1-19
+# range so LA (1-8, plus 16 - see below), RA (9-15, plus 17-19), and a
+# future "both" chamber all get a complete, consistent legend regardless
+# of which subset is present in a given mesh. Index 0 (unmatched/
+# unlabelled) is a flat light grey, kept visually distinct from every real
+# segment colour. 1-15 are Sasha Trubetskoy's "20 distinct colours" set (a
+# hand-tuned categorical palette, not an evenly-spaced hue wheel) - chosen
+# for maximum contrast between neighbouring labels rather than smooth/
+# pretty transitions, which is what actually matters when comparing
+# adjacent regions on the mesh. 16-19 use 4 more colours from that same
+# 20-colour set (lavender/beige/mint/apricot - skipping its remaining
+# grey, too close to 0's own light grey) for LA_SEGMENT_BORDERS[16] and
+# RA_SEGMENT_BORDERS[17-19]: the leftover-tissue segments that only ever
+# appear if a boundary landmark wasn't actually snapped to its rim (see
+# geodesics.py) - normally these never appear at all.
 REGION_COLORS = [
     "#cfcfcf",  # 0: unlabelled
     "#e6194b",  # 1 red
@@ -95,6 +106,10 @@ REGION_COLORS = [
     "#800000",  # 13 maroon
     "#808000",  # 14 olive
     "#000075",  # 15 navy
+    "#dcbeff",  # 16 lavender
+    "#fffac8",  # 17 beige
+    "#aaffc3",  # 18 mint
+    "#ffd8b1",  # 19 apricot
 ]
 
 
@@ -286,7 +301,7 @@ class LandmarkPickerWidget(QMainWindow):
         if current is None:
             return
 
-        if current.kind == "boundary":
+        if self._shift_held():
             if not self.boundary.available:
                 print(f"{current.name}: mesh has no open boundary edges to snap to.")
                 return
@@ -297,7 +312,7 @@ class LandmarkPickerWidget(QMainWindow):
                 return
         xyz = self.mesh.points[vertex_id]
 
-        if current.kind in ("point", "boundary"):
+        if current.kind == "point":
             prior_index = self.index
             self.session.set_point(current.name, vertex_id, xyz)
             self._draw_point_marker(current.name, xyz, POINT_COLOR)
@@ -310,6 +325,9 @@ class LandmarkPickerWidget(QMainWindow):
 
         self._refresh_status()
         self._update_geodesics()
+
+    def _shift_held(self) -> bool:
+        return bool(self.plotter.iren.interactor.GetShiftKey())
 
     def _push_undo(self, reverse: Callable[[], None]) -> None:
         self._undo_stack.append(reverse)
@@ -332,6 +350,8 @@ class LandmarkPickerWidget(QMainWindow):
             self.plotter.remove_scalar_bar()
         if "Regions" in self.mesh.cell_data:
             self.mesh.cell_data.remove("Regions")
+        if "Regions_display" in self.mesh.cell_data:
+            self.mesh.cell_data.remove("Regions_display")
         self.plotter.add_mesh(
             self.mesh, color="lightgray", show_edges=False, smooth_shading=True, pickable=True,
             name="main_mesh",
@@ -347,9 +367,16 @@ class LandmarkPickerWidget(QMainWindow):
         prior_buffer = list(self._loop_buffer)  # snapshot, for undo
 
         if current.kind == "loop":
-            if len(self._loop_buffer) < 3:
-                print(f"Need at least 3 points to close the {current.name} loop "
-                      f"({len(self._loop_buffer)} placed).")
+            # seed_points (e.g. KN_loop's K, N) count toward the minimum of
+            # 3 but aren't stored in the buffer/session.loops themselves -
+            # they're resolved fresh from session.points wherever needed
+            # (see _loop_vertex_ids), so the loop always reflects their
+            # current position rather than a stale baked-in copy.
+            n_needed = max(0, 3 - len(current.seed_points))
+            if len(self._loop_buffer) < n_needed:
+                print(f"Need at least {n_needed} more point(s) to close the "
+                      f"{current.name} loop ({len(self._loop_buffer)} of at least "
+                      f"{n_needed} placed).")
                 return
             vertex_ids = [v for v, _ in self._loop_buffer]
             xyz_list = [xyz for _, xyz in self._loop_buffer]
@@ -462,32 +489,49 @@ class LandmarkPickerWidget(QMainWindow):
             print(f"  + {len(tiny)} tiny piece(s) (<{noise_threshold} cells, {tiny_cells} cells "
                   "total, mostly resolved above)")
 
-        # Colour range covers only the segments this chamber actually has
-        # (1-8 for LA, 9-15 for RA), each integer centred in its colour
-        # block, rather than the full 0-15 range - unlabelled (0) cells
-        # still get coloured (clamped to the nearest end), which is fine
-        # since they're easy to pick out separately in post-processing.
+        # Colour range covers only the segments actually present in this
+        # result: the chamber's normal contiguous range (1-8 for LA, 9-15
+        # for RA), plus its leftover-tissue segment(s) (16 for LA; 17-19
+        # for RA - see geodesics.py) if and only if any of those actually
+        # occur here, which is the unusual case (a boundary landmark
+        # wasn't snapped to its rim). Present values are remapped to a
+        # contiguous 0..n display range purely for colouring/the scalar
+        # bar, so the legend never shows a gap for chamber values that
+        # can't occur (e.g. LA never has 9-15) or, in the normal case,
+        # doesn't occur this time (e.g. 16 not present) - `self.mesh`'s own
+        # "Regions" cell data keeps the true segment numbers throughout.
         lo, hi = {"LA": (1, 8), "RA": (9, 15)}.get(self.chamber, (1, 15))
+        extra = {"LA": (16,), "RA": (17, 18, 19)}.get(self.chamber, ())
+        valid = set(range(lo, hi + 1)) | set(extra)
+        present = sorted(valid & set(int(v) for v in labels))
+        if not present:
+            print("Nothing matched - nothing to colour.")
+            return
+        display_index = {v: i for i, v in enumerate(present)}
+        display_labels = np.array([display_index.get(int(v), -1) for v in labels])
+        self.mesh.cell_data["Regions_display"] = display_labels
+
         # `n_labels` spaces ticks evenly across the *continuous* clim range,
-        # including its fractional lo-0.5/hi+0.5 endpoints - it doesn't know
-        # the integers are what matter. `annotations` instead pins each
-        # tick to an exact value, so the scalar bar lands exactly on
-        # 1..8 / 9..15 with no fractional labels. `n_labels: 0` additionally
+        # including its fractional endpoints - it doesn't know the integers
+        # are what matter. `annotations` instead pins each tick to an exact
+        # value, so the scalar bar lands exactly on the present segment
+        # numbers with no fractional labels. `n_labels: 0` additionally
         # suppresses vtk's own automatic tick labels (which otherwise still
         # draw alongside the annotations, at positions that don't line up
         # with the colour block centres).
         if self.plotter.scalar_bars:
             self.plotter.remove_scalar_bar()
         self.plotter.add_mesh(
-            self.mesh, scalars="Regions", cmap=REGION_COLORS[lo : hi + 1], clim=[lo - 0.5, hi + 0.5],
+            self.mesh, scalars="Regions_display", cmap=[REGION_COLORS[v] for v in present],
+            clim=[-0.5, len(present) - 0.5],
             show_edges=False, smooth_shading=False, pickable=True, name="main_mesh",
             scalar_bar_args={"title": "Region", "fmt": "%.0f", "n_labels": 0},
-            annotations={float(i): str(i) for i in range(lo, hi + 1)},
+            annotations={float(i): str(v) for i, v in enumerate(present)},
         )
-        self._draw_region_number_labels(labels, lo, hi)
+        self._draw_region_number_labels(labels, present)
         self.confirm_button.setEnabled(True)
 
-    def _draw_region_number_labels(self, labels, lo: int, hi: int) -> None:
+    def _draw_region_number_labels(self, labels, present: list[int]) -> None:
         """Float each present segment's number just outside the surface, so
         the computed regions can be visually cross-checked against the
         reference figure (which numbers segments the same way).
@@ -502,7 +546,6 @@ class LandmarkPickerWidget(QMainWindow):
         the surface and is offset in a direction that's locally correct
         there."""
         self.plotter.remove_actor("region_number_labels")
-        present = sorted(seg for seg in set(int(v) for v in labels) if lo <= seg <= hi)
         if not present:
             return
         mesh = self.mesh
@@ -552,24 +595,38 @@ class LandmarkPickerWidget(QMainWindow):
         for prefix in ("marker_", "label_", "loopline_"):
             self.plotter.remove_actor(f"{prefix}{name}")
 
-    def _geodesic_chain(self, vertex_ids: list[int], close: bool) -> pv.PolyData | None:
-        """Concatenate mesh geodesics between consecutive vertex ids."""
-        n = len(vertex_ids)
-        pairs = list(zip(vertex_ids, vertex_ids[1:])) if not close else [
-            (vertex_ids[i], vertex_ids[(i + 1) % n]) for i in range(n)
-        ]
-        segments = [self.mesh.geodesic(a, b) for a, b in pairs if a != b]
-        if not segments:
+    def _smart_chain_polydata(self, vertex_ids: list[int], close: bool) -> pv.PolyData | None:
+        """Build a drawable polyline through consecutive vertex ids, using a
+        rim arc wherever two consecutive ones share a detected mesh
+        boundary loop and a geodesic otherwise - see geometry.smart_chain.
+        This is purely visual, but mirrors exactly what segmentation.py
+        will actually compute, so what's drawn matches what gets cut."""
+        if len(vertex_ids) < 2:
             return None
-        combined = segments[0]
-        for seg in segments[1:]:
-            combined = combined + seg
-        return combined
+        dense_ids = smart_chain(self.mesh, self.boundary, vertex_ids, close=close)
+        if len(dense_ids) < 2:
+            return None
+        return pv.lines_from_points(self.mesh.points[dense_ids], close=close)
+
+    def _loop_vertex_ids(self, name: str) -> list[int]:
+        """Full vertex id list for a finished loop landmark, including any
+        seed_points prepended (e.g. KN_loop's K, N) - session.loops only
+        stores the operator's own clicked waypoints, so this always
+        reflects those points' current position rather than a stale
+        baked-in copy."""
+        spec = self.plan_by_name[name]
+        ids = list(self.session.loops[name]["vertex_ids"])
+        if spec.seed_points:
+            seed_ids = [self.session.points[n]["vertex_id"] for n in spec.seed_points]
+            ids = [*seed_ids, *ids]
+        return ids
 
     def _draw_buffer_progress(self, name: str) -> None:
         """Preview the in-progress waypoints of a loop or path landmark.
-        For a path, the chain is anchored to path_start so the first
-        waypoint is visibly connected as soon as it's placed."""
+        For a path, the chain is anchored to path_start; for a seeded loop
+        (e.g. KN_loop), to its seed_points - so the chain is visibly
+        connected from the start as soon as the first new waypoint is
+        placed."""
         spec = self.plan_by_name[name]
         ids = [v for v, _ in self._loop_buffer]
         pts = [xyz for _, xyz in self._loop_buffer]
@@ -582,22 +639,27 @@ class LandmarkPickerWidget(QMainWindow):
             start = self.session.points.get(spec.path_start)
             if start is not None:
                 chain_ids = [start["vertex_id"], *ids]
-        chain = self._geodesic_chain(chain_ids, close=False)
+        elif spec.seed_points and all(n in self.session.points for n in spec.seed_points):
+            seed_ids = [self.session.points[n]["vertex_id"] for n in spec.seed_points]
+            chain_ids = [*seed_ids, *ids]
+        chain = self._smart_chain_polydata(chain_ids, close=False)
         if chain is not None:
             self.plotter.add_mesh(chain, color=LOOP_COLOR, line_width=3, name=f"loopline_{name}")
 
     def _draw_loop_final(self, name: str) -> None:
         loop = self.session.loops[name]
-        ids = loop["vertex_ids"]
-        pts = loop["xyz"]
-        chain = self._geodesic_chain(ids, close=True)
+        full_ids = self._loop_vertex_ids(name)
+        pts = loop["xyz"]  # markers only for the operator's own waypoints - seed points already have their own
+        chain = self._smart_chain_polydata(full_ids, close=True)
         if chain is not None:
             self.plotter.add_mesh(chain, color=DONE_COLOR, line_width=4, name=f"loopline_{name}")
-        self.plotter.add_points(
-            pv.PolyData(pts), color=DONE_COLOR, point_size=10, render_points_as_spheres=True,
-            name=f"marker_{name}", pickable=False,
-        )
-        centroid = [sum(c) / len(pts) for c in zip(*pts)]
+        if pts:
+            self.plotter.add_points(
+                pv.PolyData(pts), color=DONE_COLOR, point_size=10, render_points_as_spheres=True,
+                name=f"marker_{name}", pickable=False,
+            )
+        full_xyz = self.mesh.points[full_ids]
+        centroid = full_xyz.mean(axis=0).tolist()
         self.plotter.add_point_labels(
             [centroid], [name], name=f"label_{name}", font_size=20, text_color=DONE_COLOR,
             shape=None, always_visible=False, pickable=False,
@@ -607,7 +669,7 @@ class LandmarkPickerWidget(QMainWindow):
         data = self.session.paths[name]
         ids = data["vertex_ids"]
         pts = data["xyz"]
-        chain = self._geodesic_chain(ids, close=False)
+        chain = self._smart_chain_polydata(ids, close=False)
         if chain is not None:
             self.plotter.add_mesh(chain, color=DONE_COLOR, line_width=4, name=f"loopline_{name}")
         interior_pts = pts[1:-1]  # exclude the shared start/end points (already marked)
@@ -656,6 +718,32 @@ class LandmarkPickerWidget(QMainWindow):
             else:
                 self.plotter.remove_actor(actor_name)
 
+        # Seeded loops (e.g. KN_loop) should behave exactly like a plain
+        # edge (A_B, ...) for their own seed points: connected as soon as
+        # both are placed, same as any other pair of already-placed
+        # points, not only once the operator starts adding the loop's own
+        # waypoints. Skipped once the operator's own waypoint buffer for
+        # *this* loop has started (its chain already covers the seed link
+        # itself - see _draw_buffer_progress) or the loop is finished
+        # (_draw_loop_final's closed chain covers it), to avoid drawing
+        # the same segment twice.
+        for spec in self.plan:
+            if spec.kind != "loop" or len(spec.seed_points) < 2:
+                continue
+            finished = self.session.has(spec.name)
+            mid_buffer = self.current is spec and bool(self._loop_buffer)
+            for a, b in zip(spec.seed_points, spec.seed_points[1:]):
+                actor_name = f"seedlink_{spec.name}_{a}_{b}"
+                pa, pb = self.session.points.get(a), self.session.points.get(b)
+                if finished or mid_buffer or not (pa and pb):
+                    self.plotter.remove_actor(actor_name)
+                    continue
+                chain = self._smart_chain_polydata([pa["vertex_id"], pb["vertex_id"]], close=False)
+                if chain is not None:
+                    self.plotter.add_mesh(chain, color=GEODESIC_COLOR, line_width=4, name=actor_name, pickable=False)
+                else:
+                    self.plotter.remove_actor(actor_name)
+
         for arc_edge in self.boundary_arc_edges:
             a, b = arc_edge.a, arc_edge.b
             actor_name = f"arc_{arc_edge.curve_name}"
@@ -665,16 +753,15 @@ class LandmarkPickerWidget(QMainWindow):
                 continue
             loop_a = self.boundary.loop_containing(pa["vertex_id"])
             loop_b = self.boundary.loop_containing(pb["vertex_id"])
-            if loop_a is None or loop_a != loop_b:
-                print(f"Warning: {a} and {b} are not on the same mesh boundary rim; "
-                      "cannot draw the rim arc between them.")
-                self.plotter.remove_actor(actor_name)
-                continue
-            if arc_edge.whole_loop:
-                self._draw_point_chain(actor_name, loop_a, close=True)
-            else:
+            if loop_a is not None and loop_a == loop_b:
                 arc_ids = arc_between(loop_a, pa["vertex_id"], pb["vertex_id"])
                 self._draw_point_chain(actor_name, arc_ids)
+            else:
+                # Not (both) on a detected boundary rim - falls back to a
+                # plain geodesic instead of a rim arc, same as
+                # segmentation.py; drawn in the same colour as any other
+                # cutting curve so it's visually clear it's not a rim arc.
+                self._draw_geodesic(actor_name, pa["vertex_id"], pb["vertex_id"])
 
         for a, loop_name, b in self.loop_paths:
             name_a = f"looppath_{a}_{loop_name}"
@@ -703,7 +790,7 @@ class LandmarkPickerWidget(QMainWindow):
         cached = self._full_loop_cache.get(loop_name)
         if cached is not None and cached[0] == key:
             return cached[1]
-        full_ids = dense_chain(self.mesh, clicked_ids, close=True)
+        full_ids = smart_chain(self.mesh, self.boundary, clicked_ids, close=True)
         self._full_loop_cache[loop_name] = (key, full_ids)
         return full_ids
 
@@ -715,10 +802,10 @@ class LandmarkPickerWidget(QMainWindow):
             headline = "ALL LANDMARKS PLACED"
         elif current.kind == "point":
             headline = f"Right-click: {current.name}"
-        elif current.kind == "boundary":
-            headline = f"Right-click near: {current.name}"
         elif current.kind == "path":
             headline = f"Click waypoints: {current.name}  ({current.path_start} -> {current.path_end})"
+        elif current.seed_points:
+            headline = f"Click loop points: {current.name}  (continues from {', '.join(current.seed_points)})"
         else:  # loop
             headline = f"Click loop points: {current.name}"
         self.headline_label.setText(headline)
@@ -728,14 +815,14 @@ class LandmarkPickerWidget(QMainWindow):
             details.extend(textwrap.wrap(current.description, width=48))
             if current.view:
                 details.append(f"Suggested view: {current.view}")
-            if current.kind == "boundary":
-                details.append("(snaps to the nearest valve/vein rim)")
-            elif current.kind == "path":
+            details.append("(shift+right-click to snap to the nearest valve/vein rim)")
+            if current.kind == "path":
                 n = len(self._loop_buffer)
                 details.append(f"{n} waypoint(s) placed (need >= 1) - press 'Finish loop/path'")
             elif current.kind == "loop":
                 n = len(self._loop_buffer)
-                details.append(f"{n} point(s) placed (need >= 3) - press 'Finish loop/path'")
+                n_needed = max(0, 3 - len(current.seed_points))
+                details.append(f"{n} point(s) placed (need >= {n_needed}) - press 'Finish loop/path'")
         else:
             details.append("Press 'Compute regions', then 'Confirm & Close'.")
             details.append("To move a placed landmark, press 'Undo' and place it again.")

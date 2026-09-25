@@ -8,7 +8,9 @@ named points, so it has to be manually traced) - the RAA has no equivalent
 since segment 11 closes fully from named points alone. Both chambers use
 "path" landmarks where a segment boundary needs a second, independent route
 between two points already connected by a direct geodesic (LA's antrum
-necks; RA's IVC uses the complementary rim arc instead - see geodesics.py).
+necks). RA's IVC orifice is instead a "loop" landmark seeded from its two
+already-placed boundary points (K, N) plus 1+ extra waypoints closing back
+to K - see `seed_points` below and geodesics.py.
 
 Landmarks are ordered to group consecutive points that share the same
 recommended viewing projection (per the paper's own placement instructions),
@@ -17,7 +19,7 @@ between every click:
   LA: A,B,C,D (postero-anterior) -> antrum-outer paths -> E,F,H,I
       (apico-basal / left anterior oblique) -> LAA_neck.
   RA: U,M,V,T (apico-basal / left anterior oblique, tricuspid annulus) ->
-      J,K,N,L,O (apico-basal / basal-to-apical, venous orifices) ->
+      J,K,N,KN_loop,L,O (apico-basal / basal-to-apical, venous orifices) ->
       P,Q,S (right lateral, RAA silhouette).
 
 Each landmark's `description` is a concise, paper-derived explanation of
@@ -35,18 +37,31 @@ from typing import Literal
 @dataclass(frozen=True)
 class LandmarkSpec:
     name: str
-    # "point": anywhere on the open surface.
-    # "boundary": must sit on an open mesh boundary loop (a valve/vein
-    #   orifice rim) - snapped automatically to the nearest such vertex.
-    # "loop": a closed ring of several clicked points (appendage neck).
+    # "point": anywhere on the open surface. Right-click places it raw;
+    #   shift+right-click snaps to the nearest open mesh boundary (a
+    #   valve/vein orifice rim), if the mesh has one nearby. Several of
+    #   these are *expected* to sit on a rim (e.g. the mitral/tricuspid
+    #   annulus points) but aren't required to - whether they actually do
+    #   depends on how the mesh was clipped, which segmentation checks for
+    #   itself rather than assuming from this "kind" - see geodesics.py
+    #   and segmentation.py.
+    # "loop": a closed ring of clicked points (appendage neck, or - via
+    #   `seed_points` - a venous orifice rim seeded from already-placed
+    #   points). Each point can individually be raw or shift-snapped, same
+    #   as "point".
     # "path": an open chain of 1+ clicked waypoints between two already-
     #   placed point landmarks (path_start -> waypoints -> path_end),
     #   used where a segment boundary needs a second, independent route
     #   between two points already connected by a direct geodesic.
-    kind: Literal["point", "boundary", "loop", "path"]
+    kind: Literal["point", "loop", "path"]
     description: str
     path_start: str | None = None
     path_end: str | None = None
+    # "loop" only: names of already-placed point landmarks to prepend, in
+    # order, before the operator's own clicked loop points - e.g. KN_loop
+    # starts from K and N (both already placed earlier) so the operator
+    # only has to click the remaining waypoint(s) needed to close the ring.
+    seed_points: tuple[str, ...] = ()
     # Recommended viewing projection for placing this landmark, per the
     # paper's own text - None where the paper doesn't specify one. Always
     # shown alongside the description.
@@ -90,13 +105,13 @@ LA_POINTS: list[LandmarkSpec] = [
         "to C on the side away from the dome.",
         path_start="D", path_end="C", view="Postero-anterior",
     ),
-    LandmarkSpec("E", "boundary", "Mitral annulus at 9 o'clock (septal) on the clock model.",
+    LandmarkSpec("E", "point", "Mitral annulus at 9 o'clock (septal) on the clock model.",
                  view="Apico-basal (~left anterior oblique)"),
-    LandmarkSpec("F", "boundary", "Mitral annulus at 1 o'clock (lateral) on the clock model.",
+    LandmarkSpec("F", "point", "Mitral annulus at 1 o'clock (lateral) on the clock model.",
                  view="Apico-basal (~left anterior oblique)"),
-    LandmarkSpec("H", "boundary", "Mitral annulus at 4 o'clock (infero-lateral) on the clock model.",
+    LandmarkSpec("H", "point", "Mitral annulus at 4 o'clock (infero-lateral) on the clock model.",
                  view="Apico-basal (~left anterior oblique)"),
-    LandmarkSpec("I", "boundary", "Mitral annulus at 7 o'clock (infero-septal) on the clock model.",
+    LandmarkSpec("I", "point", "Mitral annulus at 7 o'clock (infero-septal) on the clock model.",
                  view="Apico-basal (~left anterior oblique)"),
     LandmarkSpec(
         "LAA_neck", "loop",
@@ -107,22 +122,30 @@ LA_POINTS: list[LandmarkSpec] = [
 ]
 
 RA_POINTS: list[LandmarkSpec] = [
-    LandmarkSpec("U", "boundary", "Tricuspid annulus at 11 o'clock (supero-lateral) on the clock model.",
+    LandmarkSpec("U", "point", "Tricuspid annulus at 11 o'clock (supero-lateral) on the clock model.",
                  view="Apico-basal (~left anterior oblique)"),
-    LandmarkSpec("M", "boundary", "Tricuspid annulus at 1 o'clock (septal-superior) on the clock model.",
+    LandmarkSpec("M", "point", "Tricuspid annulus at 1 o'clock (septal-superior) on the clock model.",
                  view="Apico-basal (~left anterior oblique)"),
-    LandmarkSpec("V", "boundary", "Tricuspid annulus at 5 o'clock (infero-septal) on the clock model.",
+    LandmarkSpec("V", "point", "Tricuspid annulus at 5 o'clock (infero-septal) on the clock model.",
                  view="Apico-basal (~left anterior oblique)"),
-    LandmarkSpec("T", "boundary", "Tricuspid annulus at 8 o'clock (infero-lateral) on the clock model.",
+    LandmarkSpec("T", "point", "Tricuspid annulus at 8 o'clock (infero-lateral) on the clock model.",
                  view="Apico-basal (~left anterior oblique)"),
-    LandmarkSpec("J", "boundary", "Most inferior point of the coronary sinus orifice."),
-    LandmarkSpec("K", "boundary", "Most septal point of the inferior caval vein (IVC) orifice.",
+    LandmarkSpec("J", "point", "Most inferior point of the coronary sinus orifice."),
+    LandmarkSpec("K", "point", "Most septal point of the inferior caval vein (IVC) orifice.",
                  view="Apico-basal / basal-to-apical"),
-    LandmarkSpec("N", "boundary", "Most lateral point of the inferior caval vein (IVC) orifice.",
+    LandmarkSpec("N", "point", "Most lateral point of the inferior caval vein (IVC) orifice.",
                  view="Apico-basal / basal-to-apical"),
-    LandmarkSpec("L", "boundary", "Most septal point of the superior caval vein (SVC) orifice.",
+    LandmarkSpec(
+        "KN_loop", "loop",
+        "Closed boundary of the IVC orifice: continues on from K and N "
+        "(already placed) - click 1 or more further waypoints tracing "
+        "around the rest of the orifice, then finish to close the loop "
+        "back to K.",
+        seed_points=("K", "N"), view="Apico-basal / basal-to-apical",
+    ),
+    LandmarkSpec("L", "point", "Most septal point of the superior caval vein (SVC) orifice.",
                  view="Apico-basal / basal-to-apical"),
-    LandmarkSpec("O", "boundary", "Most lateral point of the superior caval vein (SVC) orifice.",
+    LandmarkSpec("O", "point", "Most lateral point of the superior caval vein (SVC) orifice.",
                  view="Apico-basal / basal-to-apical"),
     LandmarkSpec(
         "P", "point",
@@ -136,7 +159,7 @@ RA_POINTS: list[LandmarkSpec] = [
         view="Right lateral",
     ),
     LandmarkSpec(
-        "S", "boundary",
+        "S", "point",
         "Antero-superior cavoatrial junction - the most anterior point of "
         "the SVC orifice.",
         view="Right lateral",
